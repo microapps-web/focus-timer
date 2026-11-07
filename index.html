@@ -1,7 +1,16 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Focus Timer</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <style>
+/* Reset base (mismo que el entorno de Claude) */
+:root { color-scheme: light; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+[hidden] { display: none !important; }
+img { max-width: 100%; }
+
 /* Concepto de layout: una sola columna centrada. El temporizador es la pantalla principal
    y el resto de secciones (estadísticas, historial, ajustes) son hojas de lectura en gris. */
 :root {
@@ -315,7 +324,8 @@ input[type="range"]::-moz-range-thumb { width: 24px; height: 24px; border-radius
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
 </style>
-
+</head>
+<body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <symbol id="i-play" viewBox="0 0 24 24"><polygon points="7 4 20 12 7 20" fill="currentColor" stroke="currentColor" stroke-width="2"/></symbol>
   <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" rx="1.2" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" rx="1.2" fill="currentColor" stroke="none"/></symbol>
@@ -608,13 +618,15 @@ const DEFAULT_SETTINGS = { focusMin: 25, shortMin: 5, longMin: 15, soundOn: true
 const LIMITS = { focusMin: [1, 180], shortMin: [1, 60], longMin: [1, 90] };
 
 /* ---- SONIDOS ----
-   Los audios están en la carpeta audio/ junto a la página. Para cambiar uno,
-   basta con sustituir su archivo o editar su ruta en "src". */
+   Los tres MP3 van en la misma carpeta que index.html (también se busca en una
+   subcarpeta audio/ por si se prefiere ordenarlos). Los nombres deben coincidir
+   exactamente, en minúsculas y con guion: lluvia.mp3, bosque.mp3, ruido-blanco.mp3 */
 const SOUNDS = [
-  { id: 'rain',   label: 'Lluvia',       group: 'nature',  src: 'audio/lluvia.mp3' },
-  { id: 'forest', label: 'Bosque',       group: 'nature',  src: 'audio/bosque.mp3' },
-  { id: 'white',  label: 'Ruido blanco', group: 'ambient', src: 'audio/ruido-blanco.mp3' }
+  { id: 'rain',   label: 'Lluvia',       group: 'nature',  file: 'lluvia.mp3' },
+  { id: 'forest', label: 'Bosque',       group: 'nature',  file: 'bosque.mp3' },
+  { id: 'white',  label: 'Ruido blanco', group: 'ambient', file: 'ruido-blanco.mp3' }
 ];
+const AUDIO_DIRS = ['', 'audio/'];      // carpetas donde se busca, relativas a la página, por orden
 const GROUPS = { nature: 'Naturaleza y ambiente', ambient: 'Sonidos ambientales' };
 
 const $ = (s, r) => (r || document).querySelector(s);
@@ -752,20 +764,55 @@ function fmtDay(ts, now) {
 /* =====================================================================
    5. SONIDO
    ===================================================================== */
+// Carpeta de la página, siempre con "/" final: https://usuario.github.io/focus-timer/ -> .../focus-timer/
+// Así la ruta funciona tanto en la raíz de un dominio como en un subdirectorio de GitHub Pages.
+function pageDir() {
+  try {
+    const u = new URL(location.href);
+    u.search = ''; u.hash = '';
+    const last = u.pathname.split('/').pop();
+    if (!u.pathname.endsWith('/') && !/\.[a-z0-9]+$/i.test(last)) u.pathname += '/';
+    return new URL('./', u).href;
+  } catch (e) { return ''; }
+}
 const Sound = {
-  els: {}, state: {}, blocked: false,
+  els: {}, state: {}, urls: {}, idx: {}, failedAt: {}, blocked: false, dir: '',
+  candidates(s) {
+    const list = [];
+    for (const d of AUDIO_DIRS) {
+      if (this.dir) list.push(this.dir + d + s.file);
+      list.push(d + s.file);               // ruta relativa simple, como último recurso
+    }
+    return list.filter((u, i) => list.indexOf(u) === i);
+  },
   init() {
+    this.dir = pageDir();
     for (const s of SOUNDS) {
-      this.state[s.id] = 'checking';
+      const id = s.id;
+      this.state[id] = 'checking';
+      this.urls[id] = this.candidates(s);
+      this.idx[id] = 0;
       const a = new Audio();
       a.loop = true;                       // al terminar el archivo vuelve a empezar solo
       a.preload = 'metadata';
-      a.addEventListener('loadedmetadata', () => { this.state[s.id] = 'ready'; onSoundChange(); });
-      a.addEventListener('error', () => { this.state[s.id] = 'missing'; onSoundChange(); });
+      const ready = () => { if (this.state[id] !== 'ready') { this.state[id] = 'ready'; onSoundChange(); } };
+      ['loadedmetadata', 'canplay', 'playing'].forEach(ev => a.addEventListener(ev, ready));
+      a.addEventListener('error', () => {
+        if (a.error && a.error.code === 1) return;          // carga cancelada a propósito, no es un fallo
+        // Este archivo falló: se prueba la siguiente ruta. Solo se marca como no disponible este sonido.
+        if (this.idx[id] + 1 < this.urls[id].length) { this.idx[id]++; a.src = this.urls[id][this.idx[id]]; return; }
+        this.state[id] = 'missing'; this.failedAt[id] = Date.now();
+        onSoundChange();
+      });
       a.addEventListener('ended', () => { try { a.currentTime = 0; } catch (e) {} this.sync(); });   // respaldo del bucle
-      a.src = s.src;
-      this.els[s.id] = a;
+      this.els[id] = a;
+      a.src = this.urls[id][0];
     }
+  },
+  // Si un sonido había fallado (por ejemplo, por una red inestable), se vuelve a intentar al pedirlo
+  retry(s) {
+    this.state[s.id] = 'checking'; this.idx[s.id] = 0;
+    this.els[s.id].src = this.urls[s.id][0];
   },
   // Decide qué debe sonar ahora: solo durante la concentración en marcha y con el sonido activado.
   // Es la única función que reproduce o pausa: así nunca suenan dos audios a la vez.
@@ -773,6 +820,9 @@ const Sound = {
     const want = (timer.status === 'running' && timer.phase === 'focus' && settings.soundOn) ? settings.soundId : null;
     for (const s of SOUNDS) {
       const a = this.els[s.id];
+      if (s.id === want && this.state[s.id] === 'missing' && Date.now() - this.failedAt[s.id] > 15000) {
+        this.retry(s);
+      }
       if (s.id === want && this.state[s.id] !== 'missing') {
         a.volume = settings.volume / 100;
         if (a.paused) {
@@ -782,7 +832,8 @@ const Sound = {
              .catch(err => {
                if (err && err.name === 'AbortError') return;      // se pausó antes de empezar: no es un fallo
                if (err && err.name === 'NotAllowedError') { this.blocked = true; renderSoundHint(); }
-               else { this.state[s.id] = 'missing'; onSoundChange(); }
+               // Otros errores: si el archivo no carga, lo gestiona el evento "error" de ese audio.
+               // Un fallo de reproducción nunca desactiva los demás sonidos.
              });
           }
         }
@@ -1048,14 +1099,16 @@ function renderControls() {
   $('#sound-label').textContent = settings.soundOn ? snd.label + (missing ? ' · no disponible' : '') : 'Sonido desactivado';
   $('#sound-use').setAttribute('href', settings.soundOn ? '#i-vol' : '#i-mute');
   els.chipSound.setAttribute('aria-pressed', String(settings.soundOn));
-  els.chipSound.title = missing ? 'No se pudo cargar el audio de este sonido' : 'Activar o desactivar el sonido';
+  els.chipSound.title = missing ? 'No se encontró ' + snd.file + ' en ' + (Sound.dir || 'la carpeta de la página') : 'Activar o desactivar el sonido';
 
   $$('#sound-list .opt').forEach(b => {
     b.setAttribute('aria-checked', String(b.dataset.id === settings.soundId));
-    $('.tag', b).hidden = Sound.state[b.dataset.id] !== 'missing';
+    const miss = Sound.state[b.dataset.id] === 'missing';
+    $('.tag', b).hidden = !miss;
+    b.title = miss ? 'No se encontró ' + SOUNDS.find(x => x.id === b.dataset.id).file : '';
   });
   const allMissing = SOUNDS.every(s => Sound.state[s.id] === 'missing');
-  $('#sound-note').textContent = allMissing ? 'No se han podido cargar los archivos de audio, así que no sonará nada.' : 'Suena solo durante la concentración y se repite sin parar.';
+  $('#sound-note').textContent = allMissing ? 'No se han podido cargar los audios. Comprueba que lluvia.mp3, bosque.mp3 y ruido-blanco.mp3 están en ' + (Sound.dir || 'la misma carpeta que index.html') + ' y vuelve a cargar la página.' : 'Suena solo durante la concentración y se repite sin parar.';
 }
 
 function changeSetting(patch) {
@@ -1287,5 +1340,5 @@ function init() {
 init();
 })();
 </script>
-
-</body></html>
+</body>
+</html>
